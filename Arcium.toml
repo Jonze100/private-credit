@@ -12,6 +12,11 @@ localnet_timeout_secs = 60
 # Supported values: "Cerberus"
 backends = ["Cerberus"]
 
+[clusters]
+
+[clusters.devnet]
+offset = 456
+
 # Cluster offsets for non-localnet testing
 # Get your offset from `arcium init-mxe` or `arcium deploy`
 # RPC URLs are configured in Anchor.toml's [provider] section

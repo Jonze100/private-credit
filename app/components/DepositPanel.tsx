@@ -18,6 +18,7 @@ export function DepositPanel({ onTx, onDeposited }: DepositPanelProps) {
   const [price, setPrice] = useState('');
   const [status, setStatus] = useState<'idle' | 'encrypting' | 'sending' | 'waiting'>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
 
   const busy = status !== 'idle';
 
@@ -28,6 +29,7 @@ export function DepositPanel({ onTx, onDeposited }: DepositPanelProps) {
     if (!amtNum || !priceNum) { setError('Enter valid amount and price'); return; }
 
     setError(null);
+    setInfo(null);
     try {
       setStatus('encrypting');
       const provider = makeProvider(wallet as unknown as anchor.Wallet);
@@ -37,21 +39,25 @@ export function DepositPanel({ onTx, onDeposited }: DepositPanelProps) {
       const { ciphertexts, nonce } = await encryptDeposit(cipher, BigInt(Math.round(amtNum * 1e6)), BigInt(Math.round(priceNum * 1e6)));
 
       setStatus('sending');
-      const sig = await txDeposit(program, wallet as unknown as anchor.Wallet, publicKey, ciphertexts, nonce);
+      const result = await txDeposit(program, wallet as unknown as anchor.Wallet, publicKey, ciphertexts, nonce);
 
       setStatus('waiting');
       onDeposited(amtNum, priceNum);
       onTx({
-        id: sig,
+        id: result.sig,
         type: 'deposit',
         label: 'Deposit',
         detail: `${amtNum} SOL @ $${priceNum}`,
-        signature: sig,
+        signature: result.sig,
         timestamp: Date.now(),
         ok: true,
       });
       setAmount('');
       setPrice('');
+
+      if (!result.mpcFinalized && result.mpcError) {
+        setInfo(result.mpcError);
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
       onTx({
@@ -117,6 +123,7 @@ export function DepositPanel({ onTx, onDeposited }: DepositPanelProps) {
       )}
 
       {error && <p className="text-xs text-red-400">{error}</p>}
+      {info && <p className="text-xs text-yellow-400">{info}</p>}
 
       <button
         onClick={handleDeposit}

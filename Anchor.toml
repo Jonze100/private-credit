@@ -12,7 +12,7 @@ private_credit = "B5BouEdmTShxjGb9vuP3Yoc5SU9fMjNzAhibmoS1YKQL"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "https://devnet.helius-rpc.com/?api-key=12a2c61e-e5c7-4101-8e31-9863abb8e8ca"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

@@ -1,6 +1,6 @@
 // Anchor program interactions — client-side only
 import * as anchor from '@coral-xyz/anchor';
-import { PublicKey, Connection } from '@solana/web3.js';
+import { PublicKey, Connection, Keypair, Transaction, VersionedTransaction } from '@solana/web3.js';
 import BN from 'bn.js';
 import {
   getMXEPublicKey,
@@ -17,6 +17,31 @@ import { PROGRAM_ID, ARCIUM_CLUSTER_OFFSET, RPC_ENDPOINT } from './constants';
 import idl from './idl.json';
 
 export type PrivateCreditProgram = anchor.Program<anchor.Idl>;
+
+// Creates an anchor.Wallet from a raw Keypair — used for dev/testing bypasses.
+export function makeKeypairWallet(kp: Keypair): anchor.Wallet {
+  return {
+    publicKey: kp.publicKey,
+    signTransaction: async <T extends Transaction | VersionedTransaction>(tx: T): Promise<T> => {
+      if (tx instanceof VersionedTransaction) {
+        tx.sign([kp]);
+      } else {
+        (tx as Transaction).partialSign(kp);
+      }
+      return tx;
+    },
+    signAllTransactions: async <T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> => {
+      return txs.map((tx) => {
+        if (tx instanceof VersionedTransaction) {
+          tx.sign([kp]);
+        } else {
+          (tx as Transaction).partialSign(kp);
+        }
+        return tx;
+      });
+    },
+  } as anchor.Wallet;
+}
 
 export function makeProvider(wallet: anchor.Wallet): anchor.AnchorProvider {
   const conn = new Connection(RPC_ENDPOINT, 'confirmed');
@@ -77,19 +102,56 @@ function deserializeLE(bytes: Uint8Array): bigint {
   return result;
 }
 
+export type TxResult = {
+  sig: string;
+  mpcFinalized: boolean;
+  mpcError?: string;
+};
+
+function classifyMpcError(raw: string): string {
+  const r = raw.toLowerCase();
+  if (r.includes('account') && (r.includes('not found') || r.includes('does not exist') || r.includes('accountnotfound'))) {
+    return 'Transaction confirmed on-chain ✓  MXE circuits not yet uploaded to devnet — run `arcium deploy --cluster devnet` to initialize';
+  }
+  if (r.includes('timeout') || r.includes('timed out')) {
+    return 'Transaction confirmed on-chain ✓  MPC finalization timed out — Arcium cluster may be congested';
+  }
+  if (r.includes('cluster') || r.includes('mempool') || r.includes('executing')) {
+    return 'Transaction confirmed on-chain ✓  Arcium cluster accounts not found on devnet — circuits need to be deployed';
+  }
+  return `Transaction confirmed on-chain ✓  MPC finalization failed: ${raw}`;
+}
+
+export async function txCreatePosition(
+  program: PrivateCreditProgram,
+  wallet: anchor.Wallet,
+): Promise<string> {
+  const owner = wallet.publicKey;
+  const position = getPositionPda(owner);
+
+  console.log('[createPosition] sending transaction...');
+  const sig = await program.methods
+    .createPosition()
+    .accountsPartial({ owner, position })
+    .rpc({ commitment: 'confirmed' });
+  console.log('[createPosition] confirmed:', sig);
+  return sig;
+}
+
 export async function txDeposit(
   program: PrivateCreditProgram,
   wallet: anchor.Wallet,
   publicKey: Uint8Array,
   ciphertexts: Uint8Array[],
   nonce: Uint8Array,
-): Promise<string> {
+): Promise<TxResult> {
   const computationOffset = randomOffset();
   const owner = wallet.publicKey;
   const position = getPositionPda(owner);
   const nonceBN = new BN(deserializeLE(nonce).toString());
 
-  await program.methods
+  console.log('[deposit] sending transaction...');
+  const sig = await program.methods
     .deposit(
       computationOffset,
       Array.from(ciphertexts[0]),
@@ -103,15 +165,23 @@ export async function txDeposit(
       position,
     })
     .rpc({ commitment: 'confirmed' });
+  console.log('[deposit] transaction confirmed:', sig);
 
-  await awaitComputationFinalization(
-    program.provider as anchor.AnchorProvider,
-    computationOffset,
-    new PublicKey(PROGRAM_ID),
-    'confirmed',
-  );
-
-  return computationOffset.toString();
+  console.log('[deposit] awaiting MPC finalization...');
+  try {
+    await awaitComputationFinalization(
+      program.provider as anchor.AnchorProvider,
+      computationOffset,
+      new PublicKey(PROGRAM_ID),
+      'confirmed',
+    );
+    console.log('[deposit] MPC finalized');
+    return { sig, mpcFinalized: true };
+  } catch (mpcErr) {
+    const raw = mpcErr instanceof Error ? mpcErr.message : String(mpcErr);
+    console.warn('[deposit] MPC finalization failed:', raw);
+    return { sig, mpcFinalized: false, mpcError: classifyMpcError(raw) };
+  }
 }
 
 export async function txBorrow(

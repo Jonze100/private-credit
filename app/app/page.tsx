@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
+import { PublicKey, Connection, Keypair } from '@solana/web3.js';
 import * as anchor from '@coral-xyz/anchor';
 import {
   Lock, LockOpen, ArrowDownUp, ShieldCheck, Clock,
@@ -11,8 +12,10 @@ import {
 import type { LucideProps } from 'lucide-react';
 import {
   makeProvider, makeProgram, getMxeKey,
-  txDeposit, txBorrow, txComputeHealthFactor, txAccrueInterest,
+  txDeposit, txBorrow, txComputeHealthFactor, txAccrueInterest, txCreatePosition,
+  makeKeypairWallet,
 } from '../lib/program';
+import { PROGRAM_ID, RPC_ENDPOINT } from '../lib/constants';
 import {
   setupCipher, encryptDeposit, encryptBorrow, encryptHealth, encryptInterest,
   decryptHealthFactor, computeInterestIncrement,
@@ -21,6 +24,31 @@ import { LTV_MAX_PCT } from '../lib/constants';
 import type { TxEvent } from '../lib/types';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Retries an async tx on transient wallet-conflict errors (e.g. the
+// MetaMask/Zerion window.ethereum race can briefly destabilise the injected
+// provider; a short delay is enough for Phantom to settle).
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 600): Promise<T> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isConflict =
+        msg.includes('ethereum') ||
+        msg.includes('redefine') ||
+        msg.includes('Provider not found') ||
+        msg.includes('not found');
+      if (i < attempts - 1 && isConflict) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  // unreachable, but satisfies TS
+  throw new Error('withRetry exhausted');
+}
 
 function makeAnchorWallet(wallet: ReturnType<typeof useWallet>): anchor.Wallet {
   return {
@@ -44,6 +72,40 @@ function healthLabel(tone: string) {
 }
 function healthToneFor(hf: number) {
   return hf > 1.5 ? 'good' : hf >= 1.0 ? 'warn' : 'bad';
+}
+
+// ─── usePositionAccount ───────────────────────────────────────────────────────
+
+function getPositionPdaClient(owner: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('position'), owner.toBuffer()],
+    new PublicKey(PROGRAM_ID),
+  );
+  return pda;
+}
+
+type PositionStatus = 'loading' | 'exists' | 'missing' | 'disconnected';
+
+function usePositionAccount(): { status: PositionStatus; recheck: () => void } {
+  const wallet = useWallet();
+  const [status, setStatus] = useState<PositionStatus>('disconnected');
+
+  const check = useCallback(async () => {
+    if (!wallet.connected || !wallet.publicKey) { setStatus('disconnected'); return; }
+    setStatus('loading');
+    try {
+      const conn = new Connection(RPC_ENDPOINT, 'confirmed');
+      const pda = getPositionPdaClient(wallet.publicKey);
+      const info = await conn.getAccountInfo(pda);
+      setStatus(info ? 'exists' : 'missing');
+    } catch {
+      setStatus('missing');
+    }
+  }, [wallet.connected, wallet.publicKey]);
+
+  useEffect(() => { check(); }, [check]);
+
+  return { status, recheck: check };
 }
 
 // ─── Icon ─────────────────────────────────────────────────────────────────────
@@ -311,6 +373,59 @@ function HFStop({ tone, range, active }: { tone: string; range: string; active: 
   );
 }
 
+// ─── DevWalletButton ──────────────────────────────────────────────────────────
+
+function DevWalletButton({ onKeypair }: { onKeypair: (kp: Keypair) => void }) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  const [addr, setAddr] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = async () => {
+    setStatus('loading');
+    setErr(null);
+    try {
+      const res = await fetch('/api/dev-keypair');
+      if (!res.ok) throw new Error(`API error ${res.status}`);
+      const { bytes, error } = await res.json();
+      if (error) throw new Error(error);
+      const kp = Keypair.fromSecretKey(Uint8Array.from(bytes));
+      setAddr(kp.publicKey.toBase58());
+      setStatus('done');
+      onKeypair(kp);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setStatus('error');
+    }
+  };
+
+  if (status === 'done' && addr) {
+    return (
+      <div style={{
+        padding: '8px 12px', borderRadius: 8, fontSize: 12,
+        background: 'color-mix(in oklab, #14F195 8%, transparent)',
+        border: '1px solid color-mix(in oklab, #14F195 30%, transparent)',
+        color: '#14F195', display: 'flex', alignItems: 'center', gap: 6,
+      }}>
+        <Icon name="check" size={13} stroke={2} />
+        CLI wallet loaded · {addr.slice(0, 6)}…{addr.slice(-4)}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <Btn
+        variant="secondary" size="sm" icon="wallet"
+        disabled={status === 'loading'}
+        onClick={load}
+      >
+        {status === 'loading' ? 'Loading…' : 'Test with CLI wallet'}
+      </Btn>
+      {err && <p style={{ color: 'var(--danger)', fontSize: 11, marginTop: 4 }}>{err}</p>}
+    </div>
+  );
+}
+
 // ─── DepositPanel ─────────────────────────────────────────────────────────────
 
 function DepositPanel({ onDeposited, onTx }: {
@@ -318,33 +433,80 @@ function DepositPanel({ onDeposited, onTx }: {
   onTx: (e: TxEvent) => void;
 }) {
   const wallet = useWallet();
+  const [devKeypair, setDevKeypair] = useState<Keypair | null>(null);
+  const { status: positionStatus, recheck } = usePositionAccount();
   const [amount, setAmount] = useState('');
   const [price, setPrice] = useState('');
   const [err, setErr] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [logs, setLogs] = useState<string[] | null>(null);
+
+  // Returns an anchor wallet from the CLI keypair (if loaded) or Phantom.
+  const getAnchorWallet = () => {
+    if (devKeypair) return makeKeypairWallet(devKeypair);
+    return makeAnchorWallet(wallet);
+  };
+
+  const canSign = devKeypair !== null || (wallet.connected && !!wallet.publicKey);
+
+  const handleInitPosition = async () => {
+    setErr(null);
+    setLogs(null);
+    const aw = getAnchorWallet();
+    const provider = makeProvider(aw);
+    const program = makeProgram(provider);
+    await txCreatePosition(program, aw);
+    recheck();
+  };
 
   const handleDeposit = async () => {
     setErr(null);
+    setInfo(null);
+    setLogs(null);
     const amtNum = parseFloat(amount);
     const priceNum = parseFloat(price);
     if (!amtNum || !priceNum) throw new Error('Enter amount and price');
-    if (!wallet.connected || !wallet.publicKey) throw new Error('Connect wallet');
+    if (!canSign) throw new Error('Connect wallet or load CLI keypair');
 
-    const aw = makeAnchorWallet(wallet);
-    const provider = makeProvider(aw);
-    const program = makeProgram(provider);
-    const mxeKey = await getMxeKey(provider);
-    const { publicKey, cipher } = await setupCipher(mxeKey);
-    const { ciphertexts, nonce } = encryptDeposit(
-      cipher,
-      BigInt(Math.round(amtNum * 1e6)),
-      BigInt(Math.round(priceNum * 1e6)),
-    );
-    const sig = await txDeposit(program, aw, publicKey, ciphertexts, nonce);
+    try {
+      await withRetry(async () => {
+        const aw = getAnchorWallet();
+        const provider = makeProvider(aw);
+        const program = makeProgram(provider);
+        const mxeKey = await getMxeKey(provider);
+        const { publicKey, cipher } = await setupCipher(mxeKey);
+        const { ciphertexts, nonce } = encryptDeposit(
+          cipher,
+          BigInt(Math.round(amtNum * 1e6)),
+          BigInt(Math.round(priceNum * 1e6)),
+        );
+        const result = await txDeposit(program, aw, publicKey, ciphertexts, nonce);
 
-    onDeposited(amtNum, priceNum);
-    onTx({ id: sig, type: 'deposit', label: 'Deposit collateral', detail: `${amtNum} SOL @ $${priceNum}`, signature: sig, timestamp: Date.now(), ok: true });
-    setAmount('');
-    setPrice('');
+        onDeposited(amtNum, priceNum);
+        onTx({
+          id: result.sig,
+          type: 'deposit',
+          label: 'Deposit collateral',
+          detail: `${amtNum} SOL @ $${priceNum}`,
+          signature: result.sig,
+          timestamp: Date.now(),
+          ok: true,
+        });
+        setAmount('');
+        setPrice('');
+
+        if (!result.mpcFinalized && result.mpcError) {
+          setInfo(result.mpcError);
+        }
+      });
+    } catch (e: unknown) {
+      const anyErr = e as { message?: string; logs?: string[] };
+      console.error('[deposit] Full error object:', JSON.stringify(e, Object.getOwnPropertyNames(e as object), 2));
+      console.error('[deposit] Error message:', anyErr.message);
+      console.error('[deposit] Solana logs:', anyErr.logs);
+      if (anyErr.logs?.length) setLogs(anyErr.logs);
+      throw e;
+    }
   };
 
   return (
@@ -357,28 +519,83 @@ function DepositPanel({ onDeposited, onTx }: {
         <Pill tone="encrypted" icon="lock">Encrypted on-chain</Pill>
       </div>
 
-      <div className="input-group">
-        <input inputMode="decimal" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} />
-        <div className="suffix">SOL</div>
-      </div>
-
-      <div style={{ height: 10 }} />
-
-      <div className="input-group">
-        <input inputMode="decimal" placeholder="0.00" value={price} onChange={(e) => setPrice(e.target.value)} />
-        <div className="suffix">USD / SOL</div>
-      </div>
-
-      {price && amount && (
-        <div className="field-meta">
-          <span>≈ ${(parseFloat(amount) * parseFloat(price) || 0).toFixed(2)} at ${price} / SOL</span>
+      {/* Dev-only: load CLI keypair to bypass Phantom */}
+      {process.env.NODE_ENV === 'development' && (
+        <div style={{ marginBottom: 14 }}>
+          <DevWalletButton onKeypair={(kp) => { setDevKeypair(kp); recheck(); }} />
         </div>
       )}
 
-      <div style={{ height: 16 }} />
-      <EncryptingButton label="Deposit" icon="lock" disabled={!wallet.connected} onAction={handleDeposit} />
+      {/* ── Step 1: initialize position if it doesn't exist yet ── */}
+      {positionStatus === 'missing' && (
+        <>
+          <p style={{ fontSize: 13, color: 'var(--fg-muted)', marginBottom: 16 }}>
+            No on-chain position found for this wallet. Initialize one before depositing.
+          </p>
+          <EncryptingButton
+            label="Initialize Position"
+            icon="lock"
+            disabled={!canSign}
+            onAction={handleInitPosition}
+          />
+          {err && <p style={{ color: 'var(--danger)', fontSize: 12, marginTop: 8 }}>{err}</p>}
+          {logs && (
+            <pre style={{
+              marginTop: 8, padding: '8px 10px', borderRadius: 6, fontSize: 10,
+              background: 'var(--surface-0)', border: '1px solid var(--border-soft)',
+              color: 'var(--danger)', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+            }}>
+              {logs.join('\n')}
+            </pre>
+          )}
+        </>
+      )}
 
-      {err && <p style={{ color: 'var(--danger)', fontSize: 12, marginTop: 8 }}>{err}</p>}
+      {positionStatus === 'loading' && (
+        <p style={{ fontSize: 13, color: 'var(--fg-dim)' }}>Checking on-chain position…</p>
+      )}
+
+      {positionStatus === 'disconnected' && (
+        <p style={{ fontSize: 13, color: 'var(--fg-dim)' }}>Connect wallet to continue.</p>
+      )}
+
+      {/* ── Step 2: deposit form (only when position exists) ── */}
+      {positionStatus === 'exists' && (
+        <>
+          <div className="input-group">
+            <input inputMode="decimal" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} />
+            <div className="suffix">SOL</div>
+          </div>
+
+          <div style={{ height: 10 }} />
+
+          <div className="input-group">
+            <input inputMode="decimal" placeholder="0.00" value={price} onChange={(e) => setPrice(e.target.value)} />
+            <div className="suffix">USD / SOL</div>
+          </div>
+
+          {price && amount && (
+            <div className="field-meta">
+              <span>≈ ${(parseFloat(amount) * parseFloat(price) || 0).toFixed(2)} at ${price} / SOL</span>
+            </div>
+          )}
+
+          <div style={{ height: 16 }} />
+          <EncryptingButton label="Deposit" icon="lock" disabled={!canSign} onAction={handleDeposit} />
+
+          {err && <p style={{ color: 'var(--danger)', fontSize: 12, marginTop: 8 }}>{err}</p>}
+          {info && <p style={{ color: 'var(--warn)', fontSize: 12, marginTop: 8 }}>{info}</p>}
+          {logs && (
+            <pre style={{
+              marginTop: 8, padding: '8px 10px', borderRadius: 6, fontSize: 10,
+              background: 'var(--surface-0)', border: '1px solid var(--border-soft)',
+              color: 'var(--danger)', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+            }}>
+              {logs.join('\n')}
+            </pre>
+          )}
+        </>
+      )}
 
       <div className="field-meta" style={{ marginTop: 12 }}>
         <span>Position stored as ciphertext. Validators never see the amount.</span>
