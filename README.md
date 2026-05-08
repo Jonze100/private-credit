@@ -92,28 +92,43 @@ struct InterestData { borrow_amount: u64, interest_accrued: u64 }
 
 Narrower structs mean smaller ciphertexts, fewer encrypted field operations, and lower ACU cost per computation.
 
-## Architecture
+## Project Structure
 
 ```
-programs/private_credit/src/lib.rs   Anchor program: instruction routing, account validation,
-                                     queuing computations, receiving MPC callbacks, emitting events
-encrypted-ixs/src/lib.rs             ARCIS circuits: all private computation logic
-tests/private_credit.ts              Integration tests: full end-to-end MPC flow
-build/                               Compiled .arcis circuit bytecode (gitignored)
+private_credit/
+├── programs/private_credit/src/lib.rs   Anchor program — instruction routing, account
+│                                        validation, computation queuing, MPC callbacks,
+│                                        event emission
+├── encrypted-ixs/src/lib.rs             ARCIS circuits — all private computation logic
+├── tests/private_credit.ts              Integration tests — full end-to-end MPC flow
+├── build/                               Compiled .arcis circuit bytecode (gitignored)
+├── artifacts/                           Deployment artifacts (gitignored)
+└── app/                                 Next.js borrower dashboard
+    ├── app/page.tsx                     Main UI — deposit, borrow, health, interest panels
+    ├── app/api/dev-keypair/route.ts     Dev-only API route — loads CLI wallet for testing
+    ├── lib/program.ts                   Anchor client — all 5 tx functions + MPC error handling
+    ├── lib/crypto.ts                    RescueCipher encrypt/decrypt helpers
+    ├── lib/constants.ts                 Program ID, RPC endpoint, LTV cap
+    ├── providers/WalletProvider.tsx     Solana wallet adapter (Wallet Standard, auto-detect)
+    └── lib/idl.json                     Generated Anchor IDL
 ```
 
 The Anchor program handles everything that can be public. The ARCIS circuits handle everything that must stay private. They communicate via the Arcium MPC cluster: the program queues a computation, the cluster executes it off-chain under MPC, and the result is delivered back via a callback instruction.
 
-## Building Locally
+## Running Locally
 
 ### Prerequisites
-- [Arcium CLI](https://docs.arcium.com) (`arcium`)
-- [Anchor](https://www.anchor-lang.com/docs/installation) >= 0.31
-- [Solana CLI](https://docs.solanalabs.com/cli/install) >= 2.0
-- Docker with **at least 6 GB memory allocated** (for local Arcium arx nodes)
-- Node.js >= 18, Yarn
 
-### Build
+| Tool | Version | Notes |
+|------|---------|-------|
+| [Arcium CLI](https://docs.arcium.com) | latest | `arcium build`, `arcium test`, `arcium deploy` |
+| [Anchor](https://www.anchor-lang.com/docs/installation) | >= 0.31 | Solana program framework |
+| [Solana CLI](https://docs.solanalabs.com/cli/install) | >= 2.0 | `solana-keygen`, `solana airdrop` |
+| Docker | latest | Min 6 GB memory — for local Arcium arx nodes |
+| Node.js | >= 18 | Frontend + test runner |
+| Yarn | >= 1.22 | Workspace package manager |
+
+### Build the circuits and program
 
 ```bash
 arcium build
@@ -129,7 +144,7 @@ Built encrypted instruction weighing    485490072 ACUs, from build/compute_healt
 Built encrypted instruction weighing    480627952 ACUs, from build/deposit.arcis.ir.
 ```
 
-### Test
+### Run integration tests (local MPC cluster)
 
 ```bash
 ulimit -n 65536
@@ -140,11 +155,44 @@ The test suite starts a local Solana validator, spins up Arcium arx nodes as Doc
 
 > **Docker memory**: The arx node images are AMD64-only (run via Rosetta 2 on Apple Silicon). If Docker is allocated less than 6 GB, arx nodes may silently fail to process MPC computations and tests will time out. Increase memory in Docker Desktop → Settings → Resources before running.
 
-## Program ID
+### Run the frontend
 
+```bash
+cd app
+npm install
+npm run dev
 ```
-B5BouEdmTShxjGb9vuP3Yoc5SU9fMjNzAhibmoS1YKQL
-```
+
+Open [http://localhost:3000](http://localhost:3000). The UI connects to Solana devnet and the deployed program automatically.
+
+**First-time flow:**
+1. Connect a Phantom/Backpack wallet (or click **Test with CLI wallet** in dev mode to use `~/.config/solana/id.json`)
+2. The deposit panel checks for an on-chain `PositionAccount` PDA — if absent, an **Initialize Position** button appears
+3. After initialization, the deposit form unlocks
+4. All transactions route through the deployed devnet program and the Arcium MPC cluster
+
+> The MXE circuits must be deployed to devnet for MPC finalization to complete. If only the Solana program is deployed, transactions confirm on-chain but MPC finalization will timeout with an informational message — the position is still updated.
+
+## Deployed Program
+
+| Network | Program ID |
+|---------|-----------|
+| Solana devnet | `B5BouEdmTShxjGb9vuP3Yoc5SU9fMjNzAhibmoS1YKQL` |
+
+View on [Solana Explorer](https://explorer.solana.com/address/B5BouEdmTShxjGb9vuP3Yoc5SU9fMjNzAhibmoS1YKQL?cluster=devnet).
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Blockchain | Solana (devnet) |
+| Smart contract framework | Anchor 0.31 |
+| MPC infrastructure | Arcium — ARCIS circuit language, MXE cluster |
+| Encryption | RescueCipher (Arcium's MPC-native cipher) over X25519 key exchange |
+| Frontend | Next.js 14, React 18, TypeScript |
+| Wallet integration | `@solana/wallet-adapter-react` with Wallet Standard auto-detect |
+| Anchor client | `@coral-xyz/anchor`, `@arcium-hq/client` |
+| UI | CSS custom properties design system, Lucide icons, Geist font |
 
 ## License
 

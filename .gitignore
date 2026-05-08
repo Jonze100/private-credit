@@ -1,12 +1,13 @@
 .anchor
 .DS_Store
-target
+target/
 **/*.rs.bk
-node_modules
+node_modules/
+app/node_modules/
 test-ledger
 .yarn
 encrypted-ixs/arcis_temp_target
-build
+build/
 encrypted-ixs/src/main.rs
 artifacts/
 app/.next/
